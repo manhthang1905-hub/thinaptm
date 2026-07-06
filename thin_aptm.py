@@ -274,13 +274,18 @@ class App(ctk.CTk):
         aspect = E.VID_ASPECTS[self.opt_aspect.get()]; model = "veo_3_1_t2v_lite_low_priority"  # bản miễn phí (I2V engine tự đổi r2v)
         mode = self.gen_mode.get(); base = len(self.jobs); added = 0
         prompts = self._read_prompts()
+        used = {os.path.splitext(os.path.basename(j["out"]))[0].lower() for j in self.jobs}
         if mode == "i2v":
             if not self.ref_images: messagebox.showwarning("Thiếu ảnh", "Bấm 'Chọn' để chọn thư mục ảnh gốc."); return
             for i, ref in enumerate(self.ref_images):
                 pr = prompts[i] if i < len(prompts) else (prompts[-1] if prompts else "")
                 if not pr: continue
+                stem = os.path.splitext(os.path.basename(ref))[0]  # tên video = tên ảnh đầu vào
+                name = stem; k = 2
+                while name.lower() in used: name = f"{stem}_{k}"; k += 1
+                used.add(name.lower())
                 self.jobs.append({"type": "i2v", "prompt": pr, "ref": ref, "aspect": aspect, "model": model,
-                                  "out": os.path.join(out, f"{base+added+1:05d}.mp4"), "status": "chờ"}); added += 1
+                                  "out": os.path.join(out, f"{name}.mp4"), "status": "chờ"}); added += 1
         else:
             for pr in prompts:
                 self.jobs.append({"type": "t2v", "prompt": pr, "ref": None, "aspect": aspect, "model": model,
