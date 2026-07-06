@@ -32,10 +32,27 @@ def save_accs(a):
     json.dump(a, open(ACC_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
 
+def _find_brand():
+    """Tên tool + logo = file png trong thư mục (vd ThinAptm.png -> 'ThinAptm').
+    Ưu tiên png trùng tên thư mục; nếu không có thì lấy png đầu tiên. Không có png -> tên mặc định."""
+    try:
+        pngs = [f for f in os.listdir(HERE) if f.lower().endswith(".png")]
+    except Exception:
+        pngs = []
+    if not pngs:
+        return "Thìn Aptm", None
+    folder = os.path.basename(HERE.rstrip("\\/"))
+    pick = next((f for f in pngs if os.path.splitext(f)[0].lower() == folder.lower()), pngs[0])
+    return os.path.splitext(pick)[0], os.path.join(HERE, pick)
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Thìn Aptm — Tạo Video Google Flow")
+        # TÊN TOOL + LOGO lấy từ file png trong thư mục: vd ThinAptm.png -> tên "ThinAptm".
+        # Đổi tên png (vd PMQ.png) là đổi luôn tên hiển thị, không cần sửa code. (png KHÔNG lên GitHub)
+        brand, _lp = _find_brand()
+        self.title(f"{brand} — Tạo Video Google Flow")
         self.geometry("1080x720"); self.minsize(940, 640); self.configure(fg_color=BG)
         self.accounts = load_accs()
         self.jobs = []           # {type, prompt, ref, aspect, model, out, status}
@@ -44,11 +61,9 @@ class App(ctk.CTk):
         # ----- SIDEBAR -----
         side = ctk.CTkFrame(self, width=210, corner_radius=0, fg_color="#ffffff"); side.pack(side="left", fill="y")
         side.pack_propagate(False)
-        ctk.CTkLabel(side, text="🐉 Thìn Aptm", font=("", 20, "bold"), text_color=AC).pack(pady=(22, 2), padx=18, anchor="w")
+        ctk.CTkLabel(side, text=brand, font=("", 20, "bold"), text_color=AC).pack(pady=(22, 2), padx=18, anchor="w")
         ctk.CTkLabel(side, text="Tạo video Google Flow", font=("", 11), text_color=T2).pack(padx=18, anchor="w", pady=(0, 8))
-        # LOGO cá nhân hóa: bỏ ảnh tên logo.png vào folder tool là tự hiện
-        _lp = os.path.join(HERE, "logo.png")
-        if os.path.exists(_lp):
+        if _lp:
             try:
                 from PIL import Image
                 _im = Image.open(_lp); _im.thumbnail((160, 160))
@@ -388,7 +403,10 @@ class App(ctk.CTk):
                         ref_mid = E.upload_image(acc["bearer"], acc["project"], job["ref"])
                         acc["refcache"][job["ref"]] = ref_mid
                 seed = (abs(hash(job["prompt"])) % 900000) + 1
-                for attempt in range(5):
+                # Google chan toc do per-user (429 THROTTLED) khi 1 account ban qua nhanh.
+                # -> khi dinh quota: NGHI DAI (khong dem vao so lan render fail), kien nhan cho het cua so phat.
+                throttle_hits = 0
+                for attempt in range(40):
                     if self._stop: return
                     kind, ops = E.submit_video(acc["bearer"], acc["project"], job["prompt"], seed, job["aspect"], job["model"], ref_mid)
                     if kind == "ok":
@@ -400,12 +418,26 @@ class App(ctk.CTk):
                                 self.after(0, self._refresh_queue); return
                         elif pk == "failed":
                             self._log(f"  ❌ render fail: {job['prompt'][:30]}"); break
+                        time.sleep(2 + attempt)
                     elif kind == "auth":
                         break
-                    time.sleep(2 + attempt)
+                    elif kind == "quota":
+                        throttle_hits += 1
+                        wait = min(30 + throttle_hits * 20, 150)   # 30s -> ... -> 150s, cho het cua so phat
+                        if throttle_hits == 1 or throttle_hits % 3 == 0:
+                            self._log(f"  ⏳ Google chan toc do (429) [{acc['email'][:14]}] -> nghi {wait}s. Them tai khoan de nhanh hon.")
+                        for _ in range(wait):
+                            if self._stop: return
+                            time.sleep(1)
+                    else:
+                        time.sleep(3 + attempt)
                 job["status"] = "lỗi"; self.after(0, self._refresh_queue)
 
-            with ThreadPoolExecutor(max_workers=thr) as ex:
+            # 1 account chi chiu duoc it request/phut -> gioi han 2 luong/account de khong tu lam minh bi phat.
+            eff_thr = max(1, min(thr, len(prep) * 2))
+            if eff_thr < thr:
+                self._log(f"⚙️ Chi co {len(prep)} tài khoản -> chạy {eff_thr} luồng (tránh Google chặn tốc độ). Thêm tài khoản = nhanh hơn.")
+            with ThreadPoolExecutor(max_workers=eff_thr) as ex:
                 list(ex.map(work, todo))
             self._log("🎉 XONG hàng đợi.")
             self.after(0, lambda: self._refresh_queue(force=True))

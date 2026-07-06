@@ -1,4 +1,5 @@
 accounts.json
+*.png
 _profiles/
 __pycache__/
 *.mp4
