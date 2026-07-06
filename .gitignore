@@ -1,0 +1,10 @@
+accounts.json
+logo.png
+_profiles/
+__pycache__/
+*.mp4
+*.jpg
+*.jpeg
+*.png
+!logo_default.png
+_test*/

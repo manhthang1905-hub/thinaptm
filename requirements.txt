@@ -1,0 +1,5 @@
+curl_cffi
+customtkinter
+DrissionPage
+pyotp
+pillow

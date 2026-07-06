@@ -1,0 +1,54 @@
+============================================================
+   THÌN APTM — Tạo Video Google Flow (Text→Video, Image→Video)
+============================================================
+
+Tool tạo VIDEO dọc (TikTok 9:16) hoặc ngang, từ prompt (và ảnh gốc).
+Chạy nhiều tài khoản song song, không cần mở trình duyệt (trừ khi tự login).
+
+------------------------------------------------------------
+CÀI ĐẶT (máy mới — làm 1 lần):
+------------------------------------------------------------
+1. Cài Python 3.10+ tại python.org — NHỚ tích "Add Python to PATH".
+2. (Nếu dùng "Chuẩn bị tự login") cài Google Chrome.
+3. Nháy đúp  SETUP.bat  → cài đủ thư viện.
+4. Nháy đúp  CHAY.bat   → mở tool.
+
+------------------------------------------------------------
+TAB 1 — TÀI KHOẢN (2 cách):
+------------------------------------------------------------
+Cách A — NHẬP THỦ CÔNG (dễ nhất, nên dùng):
+   • Bấm "🖐 Nhập thủ công" → tool tự mở 1 cửa sổ Chrome.
+   • Bạn TỰ đăng nhập Google + vào Flow như bình thường.
+   • Khi đăng nhập xong, tool TỰ NHẬN cookie + TỰ TẮT Chrome + thêm tài khoản ✅.
+   • Muốn thêm nhiều tài khoản: bấm lại nhiều lần.
+
+Cách B — AUTO LOGIN (tự động bằng mật khẩu):
+   • Bấm "➕ Import (email|pass|2fa)" → dán mỗi dòng:  email|matkhau|ma2fa
+     (ma2fa = chuỗi bí mật 2FA, vd JBSWY3DPEHPK3PXP; không có thì để trống).
+   • Bấm "🔑 Auto login" → tool tự mở Chrome đăng nhập + lấy cookie.
+   • (Cần Google Chrome cài sẵn trên máy.)
+
+Bấm "✔ Check" bất cứ lúc nào để kiểm tra tài khoản còn sống.
+
+------------------------------------------------------------
+TAB 2 — TẠO VIDEO:
+------------------------------------------------------------
+   • Chọn "Text → Video" (chỉ prompt) hoặc "Image → Video" (ảnh gốc + prompt).
+   • (I2V) chọn thư mục ảnh gốc — ảnh thứ i ghép với prompt dòng i.
+   • Dán prompt (mỗi dòng 1 video) hoặc "Nạp từ file .txt".
+   • Chọn Tỉ lệ (Dọc 9:16 cho TikTok), Model, Thư mục lưu.
+   • Bấm "Thêm vào hàng đợi".
+
+------------------------------------------------------------
+TAB 3 — HÀNG ĐỢI:
+------------------------------------------------------------
+   • Chỉnh Số luồng (6 mặc định, máy mạnh tăng lên).
+   • Bấm "Bắt đầu". Xem Tổng / Xử lý / Xong / Lỗi + log.
+   • "Retry lỗi" làm lại job lỗi. Chạy lại tự bỏ qua video đã có.
+
+------------------------------------------------------------
+LƯU Ý:
+------------------------------------------------------------
+   • Video ra .mp4 (001.mp4, 002.mp4...). Render mất ~1-2 phút/video.
+   • Càng nhiều tài khoản chạy càng nhanh.
+   • Cookie sống nhiều ngày; hết hạn thì "Chuẩn bị" lại hoặc dán cookie mới.
