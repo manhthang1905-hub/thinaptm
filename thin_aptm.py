@@ -81,14 +81,17 @@ def _find_brand():
     return os.path.splitext(pick)[0], os.path.join(HERE, pick)
 
 
-# ============ THAM SỐ ĐỘNG CƠ CHẠY (port từ veo3top video_factory) ============
-GEN_ATTEMPTS = 40          # số lần thử submit/1 job trước khi trả job về hàng đợi (kiên nhẫn như veo3top)
-BYPASS_QUICK = 0.4         # bypass/token trượt -> thử lại NHANH (giây) — KHÔNG backoff tăng dần
-QUOTA_GIVEUP = 4           # 429 recaptcha_quota liên tiếp bao nhiêu lần thì coi account CẠN QUOTA
-QUOTA_REST = 6 * 3600      # CÁCH LY account cạn quota (6h) -> đổi account khác gánh (grind token vô ích)
+# ============ THAM SỐ ĐỘNG CƠ CHẠY (đo thực từ API Google Flow) ============
+GEN_ATTEMPTS = 60          # số lần thử submit/1 job trước khi trả job về hàng đợi (throttle hồi nhanh nên kiên nhẫn)
+SUBMIT_CONCURRENCY = 4     # SỐ submit ĐỒNG THỜI tối đa / account (đo: ~5 đồng thời là chịu được, hơn -> throttle)
+BYPASS_QUICK = 0.4         # bypass/token trượt -> thử lại NHANH (giây)
+THROTTLE_SLEEP = 2.0       # 429 USER_REQUESTS_THROTTLED = giới hạn tốc độ -> nghỉ NGẮN (giây) rồi thử lại, TỰ HỒI
+THROTTLE_STREAK = 25       # throttle liên tiếp bao nhiêu lần thì cho account nghỉ ngắn cho hạ nhiệt
+THROTTLE_COOLDOWN = 45     # nghỉ ngắn (giây) khi throttle dồn dập — KHÔNG phải cách ly dài
+QUOTA_HARD_REST = 6 * 3600 # CHỈ khi HẾT QUOTA THẬT (reason quota/credit/daily) -> cách ly dài, đổi account
 AUTH_REST = 1800           # nghỉ 30' khi 401 không cứu được bằng refresh cookie
 BEARER_TTL = 1200          # refresh bearer từ cookie sau 20' (bearer Google chết ~30')
-JOB_MAX_CYCLES = 30        # 1 job được chuyền/thử tối đa bao nhiêu lượt trước khi bỏ (chống kẹt vô hạn)
+JOB_MAX_CYCLES = 40        # 1 job được chuyền/thử tối đa bao nhiêu lượt trước khi bỏ (chống kẹt vô hạn)
 POLL_MAX = 60              # số lần poll trạng thái render / job
 
 
@@ -117,6 +120,7 @@ class AccountState:
         self.refcache = {}        # ref image path -> media_id (khỏi upload lại khi retry)
         self.lock = threading.Lock()   # serialize refresh-auth + refcache (KHÔNG serialize submit!)
         self.blk = threading.Lock()    # bảo vệ busy counter
+        self.submit_sema = threading.BoundedSemaphore(SUBMIT_CONCURRENCY)  # giới hạn submit đồng thời/account
 
     def busy_inc(self):
         with self.blk: self.busy += 1
@@ -491,7 +495,7 @@ class App(ctk.CTk):
         out = self.ent_out.get().strip()
         if not out: messagebox.showwarning("Thiếu", "Chọn thư mục lưu."); return
         aspect = E.VID_ASPECTS[self.opt_aspect.get()]; model = "veo_3_1_t2v_lite_low_priority"  # bản miễn phí (I2V engine tự đổi r2v)
-        mode = self.gen_mode.get(); base = len(self.jobs); added = 0
+        mode = self.gen_mode.get(); base = len(self.jobs); added = 0; skipped = 0
         prompts = self._read_prompts()
         naming = self.opt_naming.get()
         existing_set = {j["out"] for j in self.jobs}
@@ -502,21 +506,31 @@ class App(ctk.CTk):
                 pr = prompts[i] if i < len(prompts) else (prompts[-1] if prompts else "")
                 if not pr: continue
 
-                # Quyết định đặt tên theo cấu hình của user
+                # RESUME: đặt tên theo ảnh -> tên output CỐ ĐỊNH = tên ảnh. Rà soát thư mục output:
+                # nếu video đã có -> BỎ QUA ảnh này (không làm lại). KHÔNG thêm hậu tố _1 (giữ tên ổn định
+                # để lần chạy sau nhận ra "đã xong").
                 if naming == "Đặt tên theo ảnh":
-                    fn_base = os.path.splitext(os.path.basename(ref))[0]
-                    fn = clean_filename(fn_base)
-                elif naming == "13 ký tự đầu prompt":
+                    fn = clean_filename(os.path.splitext(os.path.basename(ref))[0]) or f"{base+added+1:03d}"
+                    unique_out = os.path.join(out, fn + ".mp4")
+                    if os.path.exists(unique_out):
+                        skipped += 1; continue                 # đã có video ở output -> bỏ qua
+                    if unique_out in existing_set:
+                        continue                               # đã có trong hàng đợi -> bỏ qua
+                    existing_set.add(unique_out)
+                    self.jobs.append({"type": "i2v", "prompt": pr, "ref": ref, "aspect": aspect, "model": model,
+                                      "out": unique_out, "status": "chờ"}); added += 1
+                    continue
+
+                # Các chế độ đặt tên khác (không ổn định cho resume) -> giữ hậu tố chống trùng.
+                if naming == "13 ký tự đầu prompt":
                     fn = clean_filename(pr[:13])
-                else: # Số thứ tự
+                else:  # Số thứ tự
                     fn = f"{base+added+1:03d}"
                 if not fn:
                     fn = f"{base+added+1:03d}"
-
                 fn = fn + ".mp4"
                 unique_out = get_unique_out_path(out, fn, existing_set)
                 existing_set.add(unique_out)
-
                 self.jobs.append({"type": "i2v", "prompt": pr, "ref": ref, "aspect": aspect, "model": model,
                                   "out": unique_out, "status": "chờ"}); added += 1
         else:
@@ -534,7 +548,16 @@ class App(ctk.CTk):
 
                 self.jobs.append({"type": "t2v", "prompt": pr, "ref": None, "aspect": aspect, "model": model,
                                   "out": unique_out, "status": "chờ"}); added += 1
-        if not added: messagebox.showwarning("Thiếu prompt", "Chưa có prompt."); return
+        if skipped:
+            self._log(f"⏭ Bỏ qua {skipped} ảnh đã có video ở thư mục lưu (resume).")
+        if not added:
+            if skipped:
+                messagebox.showinfo("Đã xong", f"Tất cả {skipped} ảnh đã có video ở thư mục lưu — không còn gì để làm.")
+            else:
+                messagebox.showwarning("Thiếu prompt", "Chưa có prompt.")
+            return
+        if skipped:
+            messagebox.showinfo("Đã thêm", f"Thêm {added} job. Bỏ qua {skipped} ảnh đã có video (resume).")
         self._refresh_queue(force=True); self._show("queue")
 
     # ============ TAB HÀNG ĐỢI ============
@@ -711,20 +734,20 @@ class App(ctk.CTk):
             else:
                 total = len(states)
                 resting = [s for s in states if s.rest_remaining() > 0]
-                r429 = [s for s in resting if s.rest_reason == "429"]
-                rother = [s for s in resting if s.rest_reason != "429"]
+                rquota = [s for s in resting if s.rest_reason == "quota"]      # hết quota thật (cách ly dài)
+                rother = [s for s in resting if s.rest_reason != "quota"]      # throttle/auth (nghỉ ngắn)
                 exploit = total - len(resting)
                 generating = sum(1 for s in states if getattr(s, "busy", 0) > 0)
                 lines = [
                     f"🎬 POOL VIDEO — 👤 Tài khoản Ultra: {total} tổng",
                     f"   🟢 Khai thác được: {exploit}   ⚡ Đang tạo: {generating}   "
-                    f"😴 Cách ly 429 ({_dur_label(QUOTA_REST)}): {len(r429)}   (nghỉ khác: {len(rother)})",
+                    f"⛔ Hết quota ({_dur_label(QUOTA_HARD_REST)}): {len(rquota)}   😴 Nghỉ ngắn: {len(rother)}",
                 ]
-                if resting:
-                    top = sorted(resting, key=lambda s: s.rest_remaining(), reverse=True)
+                if rquota:
+                    top = sorted(rquota, key=lambda s: s.rest_remaining(), reverse=True)
                     parts = [f"{str(s.email).split('@')[0][:14]}({int(s.rest_remaining()//60)}p)" for s in top[:3]]
-                    more = ".." if len(resting) > 3 else ""
-                    lines.append(f"   😴 Đang cách ly: {', '.join(parts)}{more}")
+                    more = ".." if len(rquota) > 3 else ""
+                    lines.append(f"   ⛔ Cách ly hết quota: {', '.join(parts)}{more}")
                 self.pool_lbl.configure(text="\n".join(lines))
         except Exception:
             pass
@@ -936,11 +959,12 @@ class App(ctk.CTk):
                         with st.lock:
                             st.refcache[job["ref"]] = ref_mid
 
-                # 2) Generate — thử token/bypass kiên nhẫn; phân loại lỗi để xử lý ĐÚNG
-                quota_streak = 0
+                # 2) Generate — submit giới hạn đồng thời/account (tránh throttle), phân loại lỗi để xử lý ĐÚNG
+                throttle_streak = 0
                 for attempt in range(GEN_ATTEMPTS):
                     if self._stop: return "retry_soft"
-                    kind, ops = E.submit_video(bearer, project, job["prompt"], seed, aspect, model, ref_mid)
+                    with st.submit_sema:                          # tối đa SUBMIT_CONCURRENCY submit đồng thời/account
+                        kind, ops = E.submit_video(bearer, project, job["prompt"], seed, aspect, model, ref_mid)
                     if kind == "ok":
                         pk, mid = E.poll_video(bearer, ops, max_attempts=POLL_MAX, interval=8)
                         if pk == "done":
@@ -971,18 +995,25 @@ class App(ctk.CTk):
                         st.rest(AUTH_REST, "auth")
                         self._log(f"  🔒 {st.email[:16]} 401 -> nghỉ {AUTH_REST//60}p, đổi tài khoản.")
                         return "retry_soft"
-                    elif kind == "recaptcha_quota":
-                        quota_streak += 1
-                        if quota_streak >= QUOTA_GIVEUP:
-                            st.rest(QUOTA_REST, "429")
-                            self._log(f"  ⏳ {st.email[:16]} cạn quota (429×{quota_streak}) -> cách ly {_dur_label(QUOTA_REST)}, đổi tài khoản.")
+                    elif kind == "throttle":
+                        # GIỚI HẠN TỐC ĐỘ (USER_REQUESTS_THROTTLED) -> nghỉ NGẮN rồi thử lại, TỰ HỒI (không cách ly).
+                        throttle_streak += 1
+                        if throttle_streak >= THROTTLE_STREAK:
+                            st.rest(THROTTLE_COOLDOWN, "throttle")   # dồn dập -> hạ nhiệt ngắn, đổi account tạm
                             return "retry_soft"
-                        time.sleep(1.0 + random.uniform(0, 0.8))
+                        time.sleep(THROTTLE_SLEEP + random.uniform(0, 1.0))
+                    elif kind == "quota_hard":
+                        # HẾT QUOTA THẬT (credit/ngày) -> cách ly DÀI + đổi account (grind vô ích).
+                        st.rest(QUOTA_HARD_REST, "quota")
+                        self._log(f"  ⛔ {st.email[:16]} HẾT QUOTA -> cách ly {_dur_label(QUOTA_HARD_REST)}, đổi tài khoản.")
+                        return "retry_soft"
                     elif kind in ("ratelimit", "ip_block"):
+                        throttle_streak = 0
                         time.sleep(1.5 + random.uniform(0, 1.0))   # rate theo IP: backoff nhẹ (không proxy để xoay)
                     else:  # unusual / retry -> bypass trượt lượt, thử lại NHANH
+                        throttle_streak = 0
                         time.sleep(BYPASS_QUICK + random.uniform(0, 0.4))
-                return "retry_soft"   # GEN_ATTEMPTS token vẫn chưa qua -> trả job về hàng đợi (không đổ lỗi account)
+                return "retry_soft"   # hết lượt thử -> trả job về hàng đợi (không đổ lỗi account)
 
             def worker(st):
                 while not self._stop:

@@ -166,12 +166,14 @@ def _vpayload(prompt, project, seed, aspect, model, ref_media_id=None):
 
 
 def _classify(r):
-    """Phân loại lỗi generate (port từ veo3top flow_client.classify) — MỖI loại xử lý KHÁC nhau:
-      auth            = 401 bearer chết         -> refresh bearer từ cookie
-      ip_block        = HTML "Sorry" (chặn IP)  -> backoff (không proxy để xoay)
-      recaptcha_quota = 429 RESOURCE_EXHAUSTED  -> ACCOUNT CẠN QUOTA: nghỉ dài + đổi account (grind vô ích)
-      ratelimit       = TOO_MUCH_TRAFFIC trần   -> rate-limit theo IP: backoff nhẹ
-      unusual/retry   = token/bypass trượt lượt -> thử lại NHANH (fresh request điểm cao hơn)
+    """Phân loại lỗi generate. QUAN TRỌNG: mã 429/RESOURCE_EXHAUSTED KHÔNG đủ để phân biệt —
+    phải đọc `reason` trong error.details (đã đo body thật):
+      throttle    = USER_REQUESTS_THROTTLED (giới hạn TỐC ĐỘ) -> nghỉ NGẮN vài giây, TỰ HỒI (KHÔNG cách ly dài)
+      quota_hard  = hết quota/credit ngày (QUOTA_EXCEEDED/DAILY/CREDIT/OUT_OF...) -> cách ly DÀI + đổi account
+      unusual     = reCAPTCHA/UNUSUAL_ACTIVITY -> thử lại nhanh (bypass/token khác)
+      ratelimit   = TOO_MUCH_TRAFFIC trần (rate theo IP) -> backoff nhẹ
+      ip_block    = HTML "Sorry" (chặn IP) | auth = 401 bearer chết
+    RESOURCE_EXHAUSTED không rõ reason -> coi là throttle (thực đo: submit hồi lại sau 1-2 phút, KHÔNG phải hết quota).
     """
     if r.status_code == 401:
         return "auth", None
@@ -179,23 +181,29 @@ def _classify(r):
     head = txt[:200].lower()
     if "<html" in head or "sorry" in head:
         return "ip_block", None
-    # 429: phân biệt cạn-quota-reCAPTCHA (RESOURCE_EXHAUSTED) vs rate-limit-IP (TOO_MUCH_TRAFFIC trần).
-    # Body cạn-quota CŨNG chứa TOO_MUCH_TRAFFIC -> phải check RESOURCE_EXHAUSTED/reCAPTCHA TRƯỚC.
-    if r.status_code == 429 or "TOO_MUCH_TRAFFIC" in txt or "RESOURCE_EXHAUSTED" in txt:
-        if "RESOURCE_EXHAUSTED" in txt or "reCAPTCHA" in txt or "UNUSUAL_ACTIVITY" in txt:
-            return "recaptcha_quota", None
-        return "ratelimit", None
+
+    reason = ""
     try:
-        reason = r.json()["error"]["details"][0]["reason"]
-        if reason == "PUBLIC_ERROR_UNUSUAL_ACTIVITY":
-            return "unusual", None
-        if "TOO_MUCH_TRAFFIC" in reason:
-            return "ratelimit", None
-        if "RESOURCE_EXHAUSTED" in reason:
-            return "recaptcha_quota", None
+        err = (r.json() or {}).get("error", {})
+        for d in err.get("details", []) or []:
+            if isinstance(d, dict) and d.get("reason"):
+                reason = d["reason"]; break
     except Exception:
         pass
-    if "UNUSUAL" in txt:
+    U = (reason + " " + txt[:400]).upper()
+
+    if "THROTTLED" in U:
+        return "throttle", None                 # giới hạn tốc độ -> nghỉ ngắn, tự hồi
+    if "RECAPTCHA" in U or "UNUSUAL_ACTIVITY" in U or "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in U:
+        return "unusual", None
+    if "TOO_MUCH_TRAFFIC" in U:
+        return "ratelimit", None
+    if ("QUOTA_EXCEEDED" in U or "OUT_OF_CREDIT" in U or "INSUFFICIENT" in U
+            or "DAILY" in U or "QUOTA_LIMIT" in U):
+        return "quota_hard", None               # hết quota thật -> cách ly dài
+    if r.status_code == 429 or "RESOURCE_EXHAUSTED" in U:
+        return "throttle", None                 # RESOURCE_EXHAUSTED không rõ -> throttle (mặc định an toàn)
+    if "UNUSUAL" in U:
         return "unusual", None
     return "retry", None
 
