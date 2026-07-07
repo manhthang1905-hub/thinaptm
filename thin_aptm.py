@@ -82,6 +82,7 @@ def _find_brand():
 
 
 # ============ THAM SỐ ĐỘNG CƠ CHẠY (đo thực từ API Google Flow) ============
+WORKERS_PER_ACCOUNT = 20   # số luồng render/tài khoản (cố định) — tốc độ SUBMIT thì AIMD tự điều chỉnh
 GEN_ATTEMPTS = 60          # số lần thử submit/1 job trước khi trả job về hàng đợi (throttle hồi nhanh nên kiên nhẫn)
 # --- Cổng submit THÍCH ỨNG (AIMD như điều khiển tắc nghẽn TCP): bị throttle -> giảm nhanh; chạy mượt -> tăng dần.
 #     Tự tìm tốc độ tối đa của TỪNG account (fresh chạy nhanh, gần cạn tự chậm) -> ra nhiều video nhất mà ít 429.
@@ -98,7 +99,8 @@ BEARER_TTL = 1200          # refresh bearer từ cookie sau 20' (bearer Google c
 JOB_MAX_CYCLES = 40        # 1 job được chuyền/thử tối đa bao nhiêu lượt trước khi bỏ (chống kẹt vô hạn)
 POLL_MAX = 60              # số lần poll trạng thái render / job
 AUTO_RETRY_ROUNDS = 2      # sau khi chạy xong, TỰ retry các job lỗi thêm bao nhiêu vòng
-CREDIT_LOW = 20            # remainingCredits <= mức này -> account CẠN CREDIT thật -> cách ly, đổi account
+# LƯU Ý: model lite (t2v_lite / r2v_lite) MIỄN PHÍ -> không tốn credit -> KHÔNG cách ly theo credit.
+# Account chỉ bị throttle (giới hạn tốc độ) và tự hồi; AIMD tự giảm tốc là đủ.
 
 
 def _dur_label(secs):
@@ -121,7 +123,6 @@ class AccountState:
         self.resume_at = 0.0      # nghỉ tới thời điểm này (cooldown khi throttle)
         self.rest_reason = ""     # "credit"/"quota" (cạn) | "throttle" | "auth" | "" (đang chạy)
         self.busy = 0             # số worker đang tạo video trên account này (⚡ Đang tạo)
-        self.credits = None       # remainingCredits còn lại (từ API poll) — None = chưa biết
         self._last_thr_log = 0.0  # lần cuối ghi log throttle (giới hạn 1 dòng / 30s / account)
         self.wins = 0
         self.fails = 0
@@ -646,9 +647,7 @@ class App(ctk.CTk):
         bar = ctk.CTkFrame(f, fg_color="transparent"); bar.pack(fill="x", pady=10)
         self.btn_run = ctk.CTkButton(bar, text="▶ Bắt đầu", command=self._start, fg_color=AC, hover_color=AC2, height=38, width=120, font=("", 14, "bold")); self.btn_run.pack(side="left")
         ctk.CTkButton(bar, text="■ Dừng", command=self._stop_run, fg_color="#5f6368", height=38, width=90).pack(side="left", padx=6)
-        ctk.CTkLabel(bar, text="Luồng/tài khoản:").pack(side="left", padx=(16, 2))
-        self.ent_thr = ctk.CTkEntry(bar, width=50); self.ent_thr.pack(side="left"); self.ent_thr.insert(0, self.settings.get("threads", "20"))
-        ctk.CTkLabel(bar, text="(×số tài khoản = tổng luồng, tối đa 25/tk)", font=("", 10), text_color=T2).pack(side="left", padx=(4, 0))
+        ctk.CTkLabel(bar, text="⚡ Tốc độ tự động", font=("", 11), text_color=GR).pack(side="left", padx=(16, 2))
         ctk.CTkButton(bar, text="↻ Retry lỗi", command=self._retry, fg_color="#9aa0a6", height=38, width=100).pack(side="left", padx=(16, 4))
         ctk.CTkButton(bar, text="🗑 Xóa xong", command=self._clear_done, fg_color="#9aa0a6", height=38, width=100).pack(side="left", padx=4)
         ctk.CTkButton(bar, text="🗑 Xóa Vi Phạm CS", command=self._clear_violation, fg_color="#E57373", hover_color="#EF5350", height=38, width=130).pack(side="left", padx=4)
@@ -793,35 +792,36 @@ class App(ctk.CTk):
                 self.txt_queue.tag_add(tag, f"{line_idx+1}.0", f"{line_idx+1}.end")
 
     def _update_pool(self):
-        """Cập nhật panel trạng thái POOL VIDEO mỗi 2s: tổng / khai thác được / đang tạo / cách ly 429."""
+        """Panel POOL VIDEO (cập nhật mỗi 2s): tổng quan + từng tài khoản. Tốc độ TỰ ĐỘNG (AIMD)."""
         try:
             states = getattr(self, "_pool_states", None) or []
             if not states:
                 self.pool_lbl.configure(
-                    text="🎬 POOL VIDEO — chưa chạy. Bấm ▶ Bắt đầu." if not self._running
-                    else "🎬 POOL VIDEO — đang chuẩn bị tài khoản...")
+                    text="🎬  POOL VIDEO  —  chưa chạy.  Bấm  ▶ Bắt đầu" if not self._running
+                    else "🎬  POOL VIDEO  —  đang chuẩn bị tài khoản…")
             else:
                 total = len(states)
                 resting = [s for s in states if s.rest_remaining() > 0]
-                rquota = [s for s in resting if s.rest_reason in ("quota", "credit")]  # cạn credit/quota (cách ly dài)
-                rother = [s for s in resting if s.rest_reason not in ("quota", "credit")]  # throttle/auth (nghỉ ngắn)
-                exploit = total - len(resting)
+                running = total - len(resting)
                 generating = sum(1 for s in states if getattr(s, "busy", 0) > 0)
+                made = sum(s.wins for s in states)
+                # Header tổng quan
                 lines = [
-                    f"🎬 POOL VIDEO — 👤 Tài khoản Ultra: {total} tổng",
-                    f"   🟢 Khai thác được: {exploit}   ⚡ Đang tạo: {generating}   "
-                    f"⛔ Cạn credit: {len(rquota)}   😴 Nghỉ ngắn (throttle): {len(rother)}",
+                    f"🎬  POOL VIDEO        {total} tài khoản   ·   ✅ {made} video đã tạo",
+                    f"    🟢 Chạy: {running}       ⚡ Đang tạo: {generating}       😴 Nghỉ: {len(resting)}",
+                    "    " + "─" * 52,
                 ]
-                # dòng chi tiết từng account: credit còn lại + tốc độ submit thích ứng + trạng thái
-                def _acc_line(s):
-                    cr = f"credit {s.credits}" if s.credits is not None else "credit ?"
-                    if s.rest_remaining() > 0:
-                        stt = f"⛔ cách ly {int(s.rest_remaining()//60)}p" if s.rest_reason in ("quota", "credit") else f"😴 nghỉ {int(s.rest_remaining())}s"
+                # Từng tài khoản — cột canh đều (mỗi dòng cùng cấu trúc emoji nên vẫn thẳng hàng)
+                for s in states[:8]:
+                    name = str(s.email).split("@")[0][:16]
+                    rem = s.rest_remaining()
+                    if rem > 0:
+                        stt = f"⛔ cách ly {int(rem//60)}p" if s.rest_reason in ("quota",) else f"😴 nghỉ {int(rem)}s"
                     else:
-                        stt = f"🟢 ✅{s.wins} ❌{s.fails} ⚡{s.busy}"
-                    return f"   • {str(s.email).split('@')[0][:16]:16} {cr:12} tốc độ {int(s.submit_limit)}/luồng  {stt}"
-                for s in states[:6]:
-                    lines.append(_acc_line(s))
+                        stt = "🟢 chạy"
+                    lines.append(
+                        f"    {name:<17}✅ {s.wins:<4}❌ {s.fails:<4}⚡ {s.busy:<3}🚀 tốc độ {int(s.submit_limit):<3}{stt}"
+                    )
                 self.pool_lbl.configure(text="\n".join(lines))
         except Exception:
             pass
@@ -975,9 +975,7 @@ class App(ctk.CTk):
         else:
             todo = [j for j in self.jobs if j["status"] in ("chờ", "lỗi")]
             if not todo: messagebox.showinfo("Trống", "Không có job chờ."); return
-        # "Luồng/tài khoản": mỗi tài khoản Ultra chịu ~25 luồng. 3 account × 20 = 60 render song song.
-        try: wpa = max(1, min(25, int(self.ent_thr.get() or "20")))
-        except Exception: wpa = 20
+        wpa = WORKERS_PER_ACCOUNT   # số luồng render/tài khoản cố định; tốc độ submit do AIMD tự chỉnh
         self._stop = False; self._running = True
         self.btn_run.configure(state="disabled")
         threading.Thread(target=self._run, args=(accs, todo, wpa), daemon=True).start()
@@ -1046,12 +1044,7 @@ class App(ctk.CTk):
                         st.release_submit()
                     if kind == "ok":
                         st.on_submit_ok()                         # trót lọt -> nới dần tốc độ (AIMD +)
-                        pk, mid, credits = E.poll_video(bearer, ops, max_attempts=POLL_MAX, interval=8)
-                        if credits is not None:
-                            st.credits = credits                  # cập nhật credit còn lại (hết-quota THẬT)
-                            if credits <= CREDIT_LOW:             # cạn credit -> cách ly, để account khác gánh
-                                st.rest(QUOTA_HARD_REST, "credit")
-                                self._log(f"  ⛔ {st.email[:16]} cạn credit (còn {credits}) -> cách ly, đổi tài khoản.")
+                        pk, mid, _ = E.poll_video(bearer, ops, max_attempts=POLL_MAX, interval=8)
                         if pk == "done":
                             n = E.download_video(mid, cookie, job["out"])
                             if n <= 0:                          # tải hụt -> thử lại vài lần (refresh cookie nếu cần)
@@ -1060,8 +1053,7 @@ class App(ctk.CTk):
                                     time.sleep(3); n = E.download_video(mid, cookie, job["out"])
                                     if n > 0: break
                             if n > 0:
-                                cr = f" · credit {st.credits}" if st.credits is not None else ""
-                                self._log(f"  ✅ {os.path.basename(job['out'])} ({n//1024}KB) [{st.email[:16]}{cr}]")
+                                self._log(f"  ✅ {os.path.basename(job['out'])} ({n//1024}KB) [{st.email[:16]}]")
                                 return "success"
                             return ("fail", "tải video lỗi")
                         elif pk == "failed":
@@ -1205,7 +1197,6 @@ class App(ctk.CTk):
                 "aspect": self.opt_aspect.get(),
                 "naming": self.opt_naming.get(),
                 "out_dir": self.ent_out.get(),
-                "threads": self.ent_thr.get(),
                 "image_paths": self.image_paths,
                 "custom_prompts": custom_prompts,
                 "t2v_prompts": self.txt_prompts.get("1.0", "end-1c") if self.gen_mode.get() == "t2v" else "",
