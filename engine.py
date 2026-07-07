@@ -295,6 +295,45 @@ def poll_video(bearer, ops, max_attempts=90, interval=8, timeout=60):
     return "timeout", None, credits
 
 
+# ---------- GEMINI: viết lại prompt vi phạm chính sách ----------
+GEMINI_MODEL = "gemini-flash-latest"   # đã kiểm: gemini-2.0-flash hay 429, 1.5 đã 404; latest chạy ổn
+
+def rewrite_prompt(api_key, prompt, timeout=30, model=None):
+    """Nhờ Gemini viết lại prompt bị lọc nội dung -> bản AN TOÀN (giữ ý, tránh vi phạm).
+    Trả ('ok', prompt_mới) | ('dead', None) [key sai/hết quyền] | ('busy', None) [429/lỗi -> thử key khác]."""
+    if not api_key or not prompt:
+        return "busy", None
+    model = model or GEMINI_MODEL
+    instr = (
+        "Rewrite the following text-to-video prompt so it PASSES content-safety filters. "
+        "Keep the same product, scene and intent, but remove violence, weapons framed as dangerous, "
+        "real people/celebrities, brand logos, and copyrighted music/audio. "
+        "Output EXACTLY ONE line containing ONLY the rewritten English prompt — "
+        "no preamble, no options, no quotes, no markdown.\n\nPROMPT: " + prompt
+    )
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    payload = {"contents": [{"parts": [{"text": instr}]}], "generationConfig": {"temperature": 1.0}}
+    try:
+        r = cffi.post(url, headers={"Content-Type": "application/json"}, data=json.dumps(payload), **_kw(timeout))
+    except Exception as e:
+        _log_err(f"rewrite_prompt exception: {e}")
+        return "busy", None
+    if r.status_code == 200:
+        try:
+            cand = ((r.json().get("candidates") or [{}])[0])
+            parts = (cand.get("content") or {}).get("parts") or []
+            text = " ".join(p.get("text", "") for p in parts).strip()
+            return ("ok", text) if text else ("busy", None)   # có thể bị chính Gemini chặn -> thử lại/key khác
+        except Exception:
+            return "busy", None
+    if r.status_code in (400, 401, 403):
+        return "dead", None                                    # key sai / hết quyền -> loại key
+    if r.status_code == 429:
+        return "busy", None                                    # key hết quota tạm -> thử key khác
+    _log_err(f"rewrite_prompt Gemini status {r.status_code}: {r.text[:150]}")
+    return "busy", None
+
+
 def download_video(media_id, cookie, dst, timeout=180):
     H = {"Cookie": cookie, "User-Agent": UA_CH, "Referer": "https://labs.google/", "Accept": "*/*"}
     try:

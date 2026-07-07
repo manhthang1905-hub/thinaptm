@@ -99,6 +99,7 @@ BEARER_TTL = 1200          # refresh bearer từ cookie sau 20' (bearer Google c
 JOB_MAX_CYCLES = 40        # 1 job được chuyền/thử tối đa bao nhiêu lượt trước khi bỏ (chống kẹt vô hạn)
 POLL_MAX = 60              # số lần poll trạng thái render / job
 AUTO_RETRY_ROUNDS = 2      # sau khi chạy xong, TỰ retry các job lỗi thêm bao nhiêu vòng
+MAX_REWRITES = 3           # prompt vi phạm -> nhờ Gemini viết lại tối đa bao nhiêu lần trước khi bỏ
 # LƯU Ý: model lite (t2v_lite / r2v_lite) MIỄN PHÍ -> không tốn credit -> KHÔNG cách ly theo credit.
 # Account chỉ bị throttle (giới hạn tốc độ) và tự hồi; AIMD tự giảm tốc là đủ.
 
@@ -243,6 +244,11 @@ class App(ctk.CTk):
         self._stop = False; self._running = False
         self.check_vars = []  # BooleanVar cho mỗi job trong hàng đợi
         self._pool_states = []  # AccountState[] của phiên chạy hiện tại (cho panel trạng thái pool)
+        # Gemini: viết lại prompt vi phạm (nhiều key, xoay tìm key dùng được)
+        self.gemini_keys = self.settings.get("gemini_keys", [])
+        self._gemini_bad = set()       # key sai/hết quyền -> loại
+        self._gemini_lock = threading.Lock()
+        self._gemini_active = []       # danh sách key dùng cho phiên chạy hiện tại
 
         # Khởi tạo file log.txt và xóa trắng dữ liệu cũ
         self.log_path = os.path.join(HERE, "log.txt")
@@ -312,6 +318,15 @@ class App(ctk.CTk):
         self.acc_scroll = ctk.CTkScrollableFrame(f, fg_color=CARD, corner_radius=8)
         self.acc_scroll.pack(fill="both", expand=True, pady=(2, 8))
         self.lbl_acc_prog = ctk.CTkLabel(f, text="", font=("", 12), text_color=T2); self.lbl_acc_prog.pack(anchor="w")
+
+        # --- API GEMINI: viết lại prompt vi phạm chính sách (nhiều key, mỗi dòng 1 key) ---
+        gcard = ctk.CTkFrame(f, fg_color=CARD, corner_radius=10); gcard.pack(fill="x", pady=(6, 0))
+        ctk.CTkLabel(gcard, text="🔑 API Gemini — tự viết lại prompt vi phạm rồi thử lại (mỗi dòng 1 key)",
+                     font=("", 12, "bold"), text_color=T1).pack(anchor="w", padx=12, pady=(8, 2))
+        self.txt_gemini = ctk.CTkTextbox(gcard, height=54, font=("Consolas", 11))
+        self.txt_gemini.pack(fill="x", padx=12, pady=(0, 10))
+        if self.gemini_keys:
+            self.txt_gemini.insert("1.0", "\n".join(self.gemini_keys))
         self._refresh_acc()
 
     def _refresh_acc(self):
@@ -639,11 +654,19 @@ class App(ctk.CTk):
             c = ctk.CTkFrame(st, fg_color=CARD, corner_radius=10); c.pack(side="left", expand=True, fill="x", padx=4)
             ctk.CTkLabel(c, text=txt, font=("", 12), text_color=T2).pack(pady=(10, 0))
             lb = ctk.CTkLabel(c, text="0", font=("", 24, "bold"), text_color=col); lb.pack(pady=(0, 10)); self.stat_lbl[key] = lb
-        # --- PANEL TRẠNG THÁI POOL VIDEO (live: khai thác / đang tạo / cách ly 429) ---
-        poolcard = ctk.CTkFrame(f, fg_color="#0f1b3d", corner_radius=10); poolcard.pack(fill="x", pady=(8, 0))
-        self.pool_lbl = ctk.CTkLabel(poolcard, text="🎬 POOL VIDEO — chưa chạy. Bấm ▶ Bắt đầu.",
-                                     font=("Consolas", 12), text_color="#8be9c0", justify="left", anchor="w")
-        self.pool_lbl.pack(fill="x", padx=14, pady=10)
+        # --- PANEL POOL VIDEO (đồng bộ thiết kế: card trắng + số to màu như ô thống kê trên) ---
+        poolcard = ctk.CTkFrame(f, fg_color=CARD, corner_radius=12); poolcard.pack(fill="x", pady=(8, 0))
+        ctk.CTkLabel(poolcard, text="🎬  Pool khai thác", font=("", 14, "bold"), text_color=T1).pack(anchor="w", padx=16, pady=(12, 2))
+        prow = ctk.CTkFrame(poolcard, fg_color="transparent"); prow.pack(fill="x", padx=10, pady=(2, 4))
+        self.pool_stat_lbl = {}
+        for key, txt, col in [("acc", "Tài khoản", AC), ("run", "Đang chạy", GR), ("gen", "Đang tạo", "#F9A825"), ("rest", "Nghỉ", T2)]:
+            c = ctk.CTkFrame(prow, fg_color=BG, corner_radius=8); c.pack(side="left", expand=True, fill="x", padx=4)
+            ctk.CTkLabel(c, text=txt, font=("", 11), text_color=T2).pack(pady=(6, 0))
+            lb = ctk.CTkLabel(c, text="0", font=("", 20, "bold"), text_color=col); lb.pack(pady=(0, 6))
+            self.pool_stat_lbl[key] = lb
+        self.pool_rows_frame = ctk.CTkFrame(poolcard, fg_color="transparent"); self.pool_rows_frame.pack(fill="x", padx=14, pady=(2, 12))
+        self._pool_rows = {}          # email -> {nhãn giá trị}
+        self._pool_row_sig = None     # chữ ký tập tài khoản (để biết khi nào dựng lại hàng)
         bar = ctk.CTkFrame(f, fg_color="transparent"); bar.pack(fill="x", pady=10)
         self.btn_run = ctk.CTkButton(bar, text="▶ Bắt đầu", command=self._start, fg_color=AC, hover_color=AC2, height=38, width=120, font=("", 14, "bold")); self.btn_run.pack(side="left")
         ctk.CTkButton(bar, text="■ Dừng", command=self._stop_run, fg_color="#5f6368", height=38, width=90).pack(side="left", padx=6)
@@ -792,41 +815,80 @@ class App(ctk.CTk):
                 self.txt_queue.tag_add(tag, f"{line_idx+1}.0", f"{line_idx+1}.end")
 
     def _update_pool(self):
-        """Panel POOL VIDEO (cập nhật mỗi 2s): tổng quan + từng tài khoản. Tốc độ TỰ ĐỘNG (AIMD)."""
+        """Panel POOL VIDEO (cập nhật mỗi 2s): 4 ô tổng quan + bảng tài khoản. Tốc độ TỰ ĐỘNG (AIMD)."""
         try:
             states = getattr(self, "_pool_states", None) or []
-            if not states:
-                self.pool_lbl.configure(
-                    text="🎬  POOL VIDEO  —  chưa chạy.  Bấm  ▶ Bắt đầu" if not self._running
-                    else "🎬  POOL VIDEO  —  đang chuẩn bị tài khoản…")
-            else:
-                total = len(states)
-                resting = [s for s in states if s.rest_remaining() > 0]
-                running = total - len(resting)
-                generating = sum(1 for s in states if getattr(s, "busy", 0) > 0)
-                made = sum(s.wins for s in states)
-                # Header tổng quan
-                lines = [
-                    f"🎬  POOL VIDEO        {total} tài khoản   ·   ✅ {made} video đã tạo",
-                    f"    🟢 Chạy: {running}       ⚡ Đang tạo: {generating}       😴 Nghỉ: {len(resting)}",
-                    "    " + "─" * 52,
-                ]
-                # Từng tài khoản — cột canh đều (mỗi dòng cùng cấu trúc emoji nên vẫn thẳng hàng)
-                for s in states[:8]:
-                    name = str(s.email).split("@")[0][:16]
-                    rem = s.rest_remaining()
-                    if rem > 0:
-                        stt = f"⛔ cách ly {int(rem//60)}p" if s.rest_reason in ("quota",) else f"😴 nghỉ {int(rem)}s"
+            total = len(states)
+            resting = sum(1 for s in states if s.rest_remaining() > 0)
+            running = total - resting
+            generating = sum(1 for s in states if getattr(s, "busy", 0) > 0)
+            self.pool_stat_lbl["acc"].configure(text=str(total))
+            self.pool_stat_lbl["run"].configure(text=str(running))
+            self.pool_stat_lbl["gen"].configure(text=str(generating))
+            self.pool_stat_lbl["rest"].configure(text=str(resting))
+
+            # Dựng lại bảng tài khoản khi tập tài khoản thay đổi (mỗi phiên chạy 1 lần)
+            sig = tuple(s.email for s in states)
+            if sig != self._pool_row_sig:
+                self._pool_row_sig = sig
+                for w in self.pool_rows_frame.winfo_children():
+                    w.destroy()
+                self._pool_rows = {}
+                if not states:
+                    ctk.CTkLabel(self.pool_rows_frame, text="Chưa chạy — bấm ▶ Bắt đầu.",
+                                 font=("", 11), text_color=T2).pack(anchor="w", pady=6)
+                else:
+                    cols = [("Tài khoản", 160), ("✅ Xong", 70), ("❌ Lỗi", 60),
+                            ("⚡ Tạo", 60), ("🚀 Tốc độ", 80), ("Trạng thái", 130)]
+                    hdr = ctk.CTkFrame(self.pool_rows_frame, fg_color="transparent"); hdr.pack(fill="x", pady=(0, 2))
+                    for txt, w in cols:
+                        ctk.CTkLabel(hdr, text=txt, font=("", 10, "bold"), text_color=T2, width=w, anchor="w").pack(side="left", padx=(2, 0))
+                    for i, s in enumerate(states):
+                        row = ctk.CTkFrame(self.pool_rows_frame, fg_color=("#f6f8fc" if i % 2 else CARD), corner_radius=6)
+                        row.pack(fill="x", pady=1)
+                        ctk.CTkLabel(row, text=str(s.email).split("@")[0][:22], font=("", 11), text_color=T1, width=160, anchor="w").pack(side="left", padx=(2, 0))
+                        wl = ctk.CTkLabel(row, text="0", font=("", 11, "bold"), text_color=GR, width=70, anchor="w"); wl.pack(side="left", padx=(2, 0))
+                        fl = ctk.CTkLabel(row, text="0", font=("", 11), text_color=RD, width=60, anchor="w"); fl.pack(side="left", padx=(2, 0))
+                        bl = ctk.CTkLabel(row, text="0", font=("", 11), text_color=T1, width=60, anchor="w"); bl.pack(side="left", padx=(2, 0))
+                        rl = ctk.CTkLabel(row, text="0", font=("", 11), text_color=AC, width=80, anchor="w"); rl.pack(side="left", padx=(2, 0))
+                        sl = ctk.CTkLabel(row, text="", font=("", 11), text_color=GR, width=130, anchor="w"); sl.pack(side="left", padx=(2, 0))
+                        self._pool_rows[s.email] = {"w": wl, "f": fl, "b": bl, "r": rl, "s": sl}
+
+            # Cập nhật giá trị từng tài khoản
+            for s in states:
+                r = self._pool_rows.get(s.email)
+                if not r:
+                    continue
+                r["w"].configure(text=str(s.wins))
+                r["f"].configure(text=str(s.fails))
+                r["b"].configure(text=str(s.busy))
+                r["r"].configure(text=str(int(s.submit_limit)))
+                rem = s.rest_remaining()
+                if rem > 0:
+                    if s.rest_reason == "quota":
+                        r["s"].configure(text=f"⛔ cách ly {int(rem//60)}p", text_color=RD)
                     else:
-                        stt = "🟢 chạy"
-                    lines.append(
-                        f"    {name:<17}✅ {s.wins:<4}❌ {s.fails:<4}⚡ {s.busy:<3}🚀 tốc độ {int(s.submit_limit):<3}{stt}"
-                    )
-                self.pool_lbl.configure(text="\n".join(lines))
+                        r["s"].configure(text=f"😴 nghỉ {int(rem)}s", text_color="#F9A825")
+                else:
+                    r["s"].configure(text="🟢 đang chạy", text_color=GR)
         except Exception:
             pass
         finally:
             self.after(2000, self._update_pool)
+
+    def _rewrite_prompt(self, prompt):
+        """Xoay qua các key Gemini còn tốt, nhờ viết lại prompt vi phạm. Trả prompt mới hoặc None.
+        Key sai/hết quyền (dead) -> loại; key bận/hết quota (busy) -> thử key kế."""
+        with self._gemini_lock:
+            keys = [k for k in self._gemini_active if k not in self._gemini_bad]
+        for k in keys:
+            status, text = E.rewrite_prompt(k, prompt)
+            if status == "ok" and text:
+                return text
+            if status == "dead":
+                with self._gemini_lock:
+                    self._gemini_bad.add(k)
+        return None
 
     def _log(self, m):
         try:
@@ -976,6 +1038,11 @@ class App(ctk.CTk):
             todo = [j for j in self.jobs if j["status"] in ("chờ", "lỗi")]
             if not todo: messagebox.showinfo("Trống", "Không có job chờ."); return
         wpa = WORKERS_PER_ACCOUNT   # số luồng render/tài khoản cố định; tốc độ submit do AIMD tự chỉnh
+        # Chốt danh sách key Gemini cho phiên chạy (mỗi dòng 1 key) + reset key hỏng
+        self._gemini_active = [l.strip() for l in self.txt_gemini.get("1.0", "end").splitlines() if l.strip()]
+        self._gemini_bad = set()
+        if self._gemini_active:
+            self._log(f"🔑 Gemini: {len(self._gemini_active)} key — sẽ tự viết lại prompt vi phạm.")
         self._stop = False; self._running = True
         self.btn_run.configure(state="disabled")
         threading.Thread(target=self._run, args=(accs, todo, wpa), daemon=True).start()
@@ -1058,7 +1125,15 @@ class App(ctk.CTk):
                             return ("fail", "tải video lỗi")
                         elif pk == "failed":
                             m = mid or ""
-                            if "FILTER" in m or "PROMINENT_PEOPLE" in m:   # lỗi lọc nội dung -> vi phạm cs, KHÔNG retry
+                            if "FILTER" in m or "PROMINENT_PEOPLE" in m:   # lỗi lọc nội dung (vi phạm chính sách)
+                                # Có key Gemini -> nhờ VIẾT LẠI prompt cho an toàn rồi thử lại (đến khi ra video).
+                                if self._gemini_active and job.get("_rewrites", 0) < MAX_REWRITES:
+                                    new = self._rewrite_prompt(job["prompt"])
+                                    if new and new.strip() != job["prompt"].strip():
+                                        job["_rewrites"] = job.get("_rewrites", 0) + 1
+                                        self._log(f"  ✏️ Viết lại prompt vi phạm (lần {job['_rewrites']}) -> thử lại: {new[:40]}…")
+                                        job["prompt"] = new
+                                        return "retry_soft"   # requeue, làm lại với prompt mới
                                 self._log(f"  ⚠️ Vi phạm chính sách: {job['prompt'][:30]} ({m})")
                                 return ("fail", "policy")
                             self._log(f"  ❌ render fail: {job['prompt'][:30]} ({m})")
@@ -1197,6 +1272,7 @@ class App(ctk.CTk):
                 "aspect": self.opt_aspect.get(),
                 "naming": self.opt_naming.get(),
                 "out_dir": self.ent_out.get(),
+                "gemini_keys": [l.strip() for l in self.txt_gemini.get("1.0", "end").splitlines() if l.strip()],
                 "image_paths": self.image_paths,
                 "custom_prompts": custom_prompts,
                 "t2v_prompts": self.txt_prompts.get("1.0", "end-1c") if self.gen_mode.get() == "t2v" else "",
