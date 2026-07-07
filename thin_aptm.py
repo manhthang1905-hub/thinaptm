@@ -83,17 +83,22 @@ def _find_brand():
 
 # ============ THAM SỐ ĐỘNG CƠ CHẠY (đo thực từ API Google Flow) ============
 GEN_ATTEMPTS = 60          # số lần thử submit/1 job trước khi trả job về hàng đợi (throttle hồi nhanh nên kiên nhẫn)
-SUBMIT_CONCURRENCY = 4     # SỐ submit ĐỒNG THỜI tối đa / account (đo: ~5 đồng thời là chịu được, hơn -> throttle)
+# --- Cổng submit THÍCH ỨNG (AIMD như điều khiển tắc nghẽn TCP): bị throttle -> giảm nhanh; chạy mượt -> tăng dần.
+#     Tự tìm tốc độ tối đa của TỪNG account (fresh chạy nhanh, gần cạn tự chậm) -> ra nhiều video nhất mà ít 429.
+SUBMIT_START = 3.0         # số submit đồng thời/account BAN ĐẦU
+SUBMIT_MIN = 1.0           # sàn (luôn còn 1 submit chạy)
+SUBMIT_MAX = 10.0          # trần
+SUBMIT_UP_AFTER = 5        # bao nhiêu submit OK liên tiếp thì +1 (tăng cộng — additive increase)
+SUBMIT_DOWN = 0.5          # gặp throttle thì nhân giới hạn với số này (giảm nhân — multiplicative decrease)
 BYPASS_QUICK = 0.4         # bypass/token trượt -> thử lại NHANH (giây)
-THROTTLE_SLEEP = 2.0       # 429 USER_REQUESTS_THROTTLED = giới hạn tốc độ -> nghỉ NGẮN (giây) rồi thử lại, TỰ HỒI
-THROTTLE_STREAK = 25       # throttle liên tiếp bao nhiêu lần thì cho account nghỉ ngắn cho hạ nhiệt
-THROTTLE_COOLDOWN = 45     # nghỉ ngắn (giây) khi throttle dồn dập — KHÔNG phải cách ly dài
+THROTTLE_SLEEP = 1.5       # 429 USER_REQUESTS_THROTTLED = giới hạn tốc độ -> nghỉ NGẮN (giây) rồi thử lại, TỰ HỒI
 QUOTA_HARD_REST = 6 * 3600 # CHỈ khi HẾT QUOTA THẬT (reason quota/credit/daily) -> cách ly dài, đổi account
 AUTH_REST = 1800           # nghỉ 30' khi 401 không cứu được bằng refresh cookie
 BEARER_TTL = 1200          # refresh bearer từ cookie sau 20' (bearer Google chết ~30')
 JOB_MAX_CYCLES = 40        # 1 job được chuyền/thử tối đa bao nhiêu lượt trước khi bỏ (chống kẹt vô hạn)
 POLL_MAX = 60              # số lần poll trạng thái render / job
 AUTO_RETRY_ROUNDS = 2      # sau khi chạy xong, TỰ retry các job lỗi thêm bao nhiêu vòng
+CREDIT_LOW = 20            # remainingCredits <= mức này -> account CẠN CREDIT thật -> cách ly, đổi account
 
 
 def _dur_label(secs):
@@ -114,20 +119,64 @@ class AccountState:
         self.project = None
         self.ts = 0.0             # thời điểm lấy bearer (để biết khi nào refresh)
         self.resume_at = 0.0      # nghỉ tới thời điểm này (cooldown khi throttle)
-        self.rest_reason = ""     # "429" (cạn quota) | "auth" (401) | "" (đang chạy)
+        self.rest_reason = ""     # "credit"/"quota" (cạn) | "throttle" | "auth" | "" (đang chạy)
         self.busy = 0             # số worker đang tạo video trên account này (⚡ Đang tạo)
+        self.credits = None       # remainingCredits còn lại (từ API poll) — None = chưa biết
+        self._last_thr_log = 0.0  # lần cuối ghi log throttle (giới hạn 1 dòng / 30s / account)
         self.wins = 0
         self.fails = 0
         self.refcache = {}        # ref image path -> media_id (khỏi upload lại khi retry)
         self.lock = threading.Lock()   # serialize refresh-auth + refcache (KHÔNG serialize submit!)
         self.blk = threading.Lock()    # bảo vệ busy counter
-        self.submit_sema = threading.BoundedSemaphore(SUBMIT_CONCURRENCY)  # giới hạn submit đồng thời/account
+        # --- Cổng submit THÍCH ỨNG (AIMD) ---
+        self.submit_limit = SUBMIT_START   # số submit đồng thời cho phép (tự điều chỉnh)
+        self.inflight = 0                  # số submit đang bay
+        self._ok_streak = 0                # số submit OK liên tiếp (để tăng dần)
+        self._gate = threading.Condition()
 
     def busy_inc(self):
         with self.blk: self.busy += 1
 
     def busy_dec(self):
         with self.blk: self.busy = max(0, self.busy - 1)
+
+    # ---- cổng submit thích ứng: chờ tới lượt, tự nới/thắt theo throttle ----
+    def acquire_submit(self, stop_check):
+        with self._gate:
+            while self.inflight >= int(self.submit_limit):
+                if stop_check():
+                    return False
+                self._gate.wait(0.5)
+            self.inflight += 1
+            return True
+
+    def release_submit(self):
+        with self._gate:
+            self.inflight = max(0, self.inflight - 1)
+            self._gate.notify()
+
+    def on_submit_ok(self):
+        """Submit trót lọt -> tăng dần giới hạn (additive increase) khi đủ chuỗi OK."""
+        with self._gate:
+            self._ok_streak += 1
+            if self._ok_streak >= SUBMIT_UP_AFTER and self.submit_limit < SUBMIT_MAX:
+                self.submit_limit = min(SUBMIT_MAX, self.submit_limit + 1)
+                self._ok_streak = 0
+                self._gate.notify_all()
+
+    def on_throttle(self):
+        """Bị throttle -> giảm nhanh giới hạn (multiplicative decrease) để hạ nhiệt."""
+        with self._gate:
+            self._ok_streak = 0
+            self.submit_limit = max(SUBMIT_MIN, self.submit_limit * SUBMIT_DOWN)
+
+    def should_log_throttle(self):
+        """True nếu nên ghi 1 dòng log throttle (giới hạn 1 dòng / 30s / account) — tránh ngập log."""
+        now = time.time()
+        if now - self._last_thr_log > 30:
+            self._last_thr_log = now
+            return True
+        return False
 
     def rest_remaining(self):
         return max(0.0, self.resume_at - time.time())
@@ -754,20 +803,25 @@ class App(ctk.CTk):
             else:
                 total = len(states)
                 resting = [s for s in states if s.rest_remaining() > 0]
-                rquota = [s for s in resting if s.rest_reason == "quota"]      # hết quota thật (cách ly dài)
-                rother = [s for s in resting if s.rest_reason != "quota"]      # throttle/auth (nghỉ ngắn)
+                rquota = [s for s in resting if s.rest_reason in ("quota", "credit")]  # cạn credit/quota (cách ly dài)
+                rother = [s for s in resting if s.rest_reason not in ("quota", "credit")]  # throttle/auth (nghỉ ngắn)
                 exploit = total - len(resting)
                 generating = sum(1 for s in states if getattr(s, "busy", 0) > 0)
                 lines = [
                     f"🎬 POOL VIDEO — 👤 Tài khoản Ultra: {total} tổng",
                     f"   🟢 Khai thác được: {exploit}   ⚡ Đang tạo: {generating}   "
-                    f"⛔ Hết quota ({_dur_label(QUOTA_HARD_REST)}): {len(rquota)}   😴 Nghỉ ngắn: {len(rother)}",
+                    f"⛔ Cạn credit: {len(rquota)}   😴 Nghỉ ngắn (throttle): {len(rother)}",
                 ]
-                if rquota:
-                    top = sorted(rquota, key=lambda s: s.rest_remaining(), reverse=True)
-                    parts = [f"{str(s.email).split('@')[0][:14]}({int(s.rest_remaining()//60)}p)" for s in top[:3]]
-                    more = ".." if len(rquota) > 3 else ""
-                    lines.append(f"   ⛔ Cách ly hết quota: {', '.join(parts)}{more}")
+                # dòng chi tiết từng account: credit còn lại + tốc độ submit thích ứng + trạng thái
+                def _acc_line(s):
+                    cr = f"credit {s.credits}" if s.credits is not None else "credit ?"
+                    if s.rest_remaining() > 0:
+                        stt = f"⛔ cách ly {int(s.rest_remaining()//60)}p" if s.rest_reason in ("quota", "credit") else f"😴 nghỉ {int(s.rest_remaining())}s"
+                    else:
+                        stt = f"🟢 ✅{s.wins} ❌{s.fails} ⚡{s.busy}"
+                    return f"   • {str(s.email).split('@')[0][:16]:16} {cr:12} tốc độ {int(s.submit_limit)}/luồng  {stt}"
+                for s in states[:6]:
+                    lines.append(_acc_line(s))
                 self.pool_lbl.configure(text="\n".join(lines))
         except Exception:
             pass
@@ -981,14 +1035,23 @@ class App(ctk.CTk):
                         with st.lock:
                             st.refcache[job["ref"]] = ref_mid
 
-                # 2) Generate — submit giới hạn đồng thời/account (tránh throttle), phân loại lỗi để xử lý ĐÚNG
-                throttle_streak = 0
+                # 2) Generate — cổng submit THÍCH ỨNG (tự nới/thắt theo throttle), phân loại lỗi để xử lý ĐÚNG
                 for attempt in range(GEN_ATTEMPTS):
                     if self._stop: return "retry_soft"
-                    with st.submit_sema:                          # tối đa SUBMIT_CONCURRENCY submit đồng thời/account
+                    if not st.acquire_submit(lambda: self._stop):
+                        return "retry_soft"
+                    try:
                         kind, ops = E.submit_video(bearer, project, job["prompt"], seed, aspect, model, ref_mid)
+                    finally:
+                        st.release_submit()
                     if kind == "ok":
-                        pk, mid = E.poll_video(bearer, ops, max_attempts=POLL_MAX, interval=8)
+                        st.on_submit_ok()                         # trót lọt -> nới dần tốc độ (AIMD +)
+                        pk, mid, credits = E.poll_video(bearer, ops, max_attempts=POLL_MAX, interval=8)
+                        if credits is not None:
+                            st.credits = credits                  # cập nhật credit còn lại (hết-quota THẬT)
+                            if credits <= CREDIT_LOW:             # cạn credit -> cách ly, để account khác gánh
+                                st.rest(QUOTA_HARD_REST, "credit")
+                                self._log(f"  ⛔ {st.email[:16]} cạn credit (còn {credits}) -> cách ly, đổi tài khoản.")
                         if pk == "done":
                             n = E.download_video(mid, cookie, job["out"])
                             if n <= 0:                          # tải hụt -> thử lại vài lần (refresh cookie nếu cần)
@@ -997,15 +1060,17 @@ class App(ctk.CTk):
                                     time.sleep(3); n = E.download_video(mid, cookie, job["out"])
                                     if n > 0: break
                             if n > 0:
-                                self._log(f"  ✅ {os.path.basename(job['out'])} ({n//1024}KB) [{st.email[:16]}]")
+                                cr = f" · credit {st.credits}" if st.credits is not None else ""
+                                self._log(f"  ✅ {os.path.basename(job['out'])} ({n//1024}KB) [{st.email[:16]}{cr}]")
                                 return "success"
                             return ("fail", "tải video lỗi")
                         elif pk == "failed":
-                            if mid in ("PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED", "PUBLIC_ERROR_AUDIO_FILTERED"):
-                                self._log(f"  ⚠️ Vi phạm chính sách: {job['prompt'][:30]} ({mid})")
+                            m = mid or ""
+                            if "FILTER" in m or "PROMINENT_PEOPLE" in m:   # lỗi lọc nội dung -> vi phạm cs, KHÔNG retry
+                                self._log(f"  ⚠️ Vi phạm chính sách: {job['prompt'][:30]} ({m})")
                                 return ("fail", "policy")
-                            self._log(f"  ❌ render fail: {job['prompt'][:30]} ({mid})")
-                            return ("fail", mid or "render fail")
+                            self._log(f"  ❌ render fail: {job['prompt'][:30]} ({m})")
+                            return ("fail", m or "render fail")
                         elif pk == "auth":
                             if st.ensure_auth(force=True): bearer = st.bearer
                             continue
@@ -1018,22 +1083,22 @@ class App(ctk.CTk):
                         self._log(f"  🔒 {st.email[:16]} 401 -> nghỉ {AUTH_REST//60}p, đổi tài khoản.")
                         return "retry_soft"
                     elif kind == "throttle":
-                        # GIỚI HẠN TỐC ĐỘ (USER_REQUESTS_THROTTLED) -> nghỉ NGẮN rồi thử lại, TỰ HỒI (không cách ly).
-                        throttle_streak += 1
-                        if throttle_streak >= THROTTLE_STREAK:
-                            st.rest(THROTTLE_COOLDOWN, "throttle")   # dồn dập -> hạ nhiệt ngắn, đổi account tạm
-                            return "retry_soft"
+                        # GIỚI HẠN TỐC ĐỘ (USER_REQUESTS_THROTTLED) -> tự GIẢM tốc độ submit + nghỉ ngắn, TỰ HỒI.
+                        st.on_throttle()                          # AIMD - : giảm nhanh giới hạn submit
+                        if st.should_log_throttle():
+                            self._log(f"  ⏳ {st.email[:16]}: 429 GIỚI HẠN TỐC ĐỘ — tự giảm tốc (còn {int(st.submit_limit)} luồng submit), sẽ hồi.")
                         time.sleep(THROTTLE_SLEEP + random.uniform(0, 1.0))
                     elif kind == "quota_hard":
-                        # HẾT QUOTA THẬT (credit/ngày) -> cách ly DÀI + đổi account (grind vô ích).
+                        # HẾT QUOTA THẬT (reason quota/credit/daily) -> cách ly DÀI + đổi account (grind vô ích).
                         st.rest(QUOTA_HARD_REST, "quota")
                         self._log(f"  ⛔ {st.email[:16]} HẾT QUOTA -> cách ly {_dur_label(QUOTA_HARD_REST)}, đổi tài khoản.")
                         return "retry_soft"
                     elif kind in ("ratelimit", "ip_block"):
-                        throttle_streak = 0
-                        time.sleep(1.5 + random.uniform(0, 1.0))   # rate theo IP: backoff nhẹ (không proxy để xoay)
+                        st.on_throttle()
+                        if st.should_log_throttle():
+                            self._log(f"  🌐 {st.email[:16]}: 429 rate theo IP — tự giảm tốc.")
+                        time.sleep(1.5 + random.uniform(0, 1.0))
                     else:  # unusual / retry -> bypass trượt lượt, thử lại NHANH
-                        throttle_streak = 0
                         time.sleep(BYPASS_QUICK + random.uniform(0, 0.4))
                 return "retry_soft"   # hết lượt thử -> trả job về hàng đợi (không đổ lỗi account)
 

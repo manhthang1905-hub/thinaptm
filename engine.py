@@ -235,10 +235,9 @@ def submit_video(bearer, project, prompt, seed, aspect, model, ref_media_id=None
         else:
             _log_err(f"submit_video succeeded but no operations found in JSON: {j}")
             return "retry", None
+    # 429 là throttle/quota (thường xuyên, GUI tự xử lý + ghi rõ loại) -> KHÔNG spam log ở đây.
     if r.status_code != 429:
-        _log_err(f"submit_video API failed status: {r.status_code}, response: {r.text[:300]}")
-    else:
-        _log_err(f"submit_video API failed status: 429")
+        _log_err(f"submit_video API failed status: {r.status_code}, response: {r.text[:200]}")
     return _classify(r)
 
 
@@ -257,7 +256,9 @@ def _find_status(o, out=None):
 
 
 def poll_video(bearer, ops, max_attempts=90, interval=8, timeout=60):
+    """Trả (kind, result, credits). credits = remainingCredits còn lại của account (từ API), None nếu không đọc được."""
     body = {"operations": [{"operation": {"name": n}} for n in ops]}
+    credits = None
     for attempt in range(max_attempts):
         try:
             r = cffi.post(CHECK, headers=_hc(bearer), data=json.dumps(body), **_kw(timeout))
@@ -266,17 +267,21 @@ def poll_video(bearer, ops, max_attempts=90, interval=8, timeout=60):
             time.sleep(interval); continue
         if r.status_code == 401:
             _log_err(f"poll_video unauthorized (401)")
-            return "auth", None
+            return "auth", None, credits
         if r.status_code != 200:
-            _log_err(f"poll_video check failed status {r.status_code}, response: {r.text[:300]}")
+            _log_err(f"poll_video check failed status {r.status_code}, response: {r.text[:200]}")
             time.sleep(interval); continue
-        st = _find_status(r.json())
+        j = r.json()
+        rc = j.get("remainingCredits")
+        if isinstance(rc, int):
+            credits = rc                       # số credit còn lại của account (tín hiệu hết-quota THẬT)
+        st = _find_status(j)
         if any(x in s for s in st for x in ("SUCCESSFUL", "SUCCEEDED", "COMPLETE")):
-            return "done", ops[0]
+            return "done", ops[0], credits
         if any("FAIL" in s for s in st):
             err_msg = "UNKNOWN_ERROR"
             try:
-                for o in r.json().get("operations", []):
+                for o in j.get("operations", []):
                     op_err = (o.get("operation") or {}).get("error") or {}
                     msg = op_err.get("message")
                     if msg:
@@ -284,11 +289,10 @@ def poll_video(bearer, ops, max_attempts=90, interval=8, timeout=60):
                         break
             except Exception:
                 pass
-            _log_err(f"poll_video generation failed. API response: {r.json()}")
-            return "failed", err_msg
+            return "failed", err_msg, credits   # process() sẽ ghi rõ; không spam full JSON ở đây
         time.sleep(interval)
     _log_err(f"poll_video timeout after {max_attempts} attempts.")
-    return "timeout", None
+    return "timeout", None, credits
 
 
 def download_video(media_id, cookie, dst, timeout=180):
