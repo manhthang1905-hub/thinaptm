@@ -22,6 +22,17 @@ IMG_ASPECTS = {"Dọc 9:16 (TikTok)": "IMAGE_ASPECT_RATIO_PORTRAIT", "Ngang 16:9
 VID_MODELS = {"Veo 3.1 (nhanh)": "veo_3_1_t2v_lite_low_priority", "Veo 3.1 (chất lượng)": "veo_3_1_t2v"}
 VID_I2V_MODEL = "veo_3_1_r2v_lite_low_priority"
 
+ERROR_LOG_FUNC = None
+
+def _log_err(msg):
+    if ERROR_LOG_FUNC:
+        try:
+            ERROR_LOG_FUNC(f"[Engine] {msg}")
+        except Exception:
+            pass
+    else:
+        print("[ENGINE ERROR]", msg)
+
 
 def _kw(t=60):
     return {"impersonate": IMP, "timeout": t}
@@ -41,12 +52,15 @@ def bearer_from_cookie(cookie, timeout=25):
                 try:
                     from datetime import datetime
                     if datetime.fromisoformat(str(exp).replace("Z", "+00:00")).timestamp() < time.time() + 120:
+                        _log_err("bearer_from_cookie: Cookie expired or close to expiration.")
                         return None, None
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log_err(f"bearer_from_cookie date check exception: {e}")
             return j.get("access_token"), (j.get("user") or {}).get("email")
-    except Exception:
-        pass
+        else:
+            _log_err(f"bearer_from_cookie failed status: {r.status_code}, response: {r.text[:200]}")
+    except Exception as e:
+        _log_err(f"bearer_from_cookie exception: {e}")
     return None, None
 
 
@@ -58,20 +72,28 @@ def get_project(cookie):
     H = {"Cookie": cookie, "User-Agent": UA_CH, "Referer": "https://labs.google/", "Accept": "application/json"}
     try:
         r = cffi.get("https://labs.google/fx/api/trpc/project.searchUserProjects?input=" + inp, headers=H, **_kw())
-        projs = (((r.json() or {}).get("result") or {}).get("data") or {}).get("json", {}).get("result", {}).get("projects", [])
-        if projs:
-            return projs[0]["projectId"]
-    except Exception:
-        pass
+        if r.status_code == 200:
+            projs = (((r.json() or {}).get("result") or {}).get("data") or {}).get("json", {}).get("result", {}).get("projects", [])
+            if projs:
+                return projs[0]["projectId"]
+        else:
+            _log_err(f"searchUserProjects request failed with status: {r.status_code}, response: {r.text[:200]}")
+    except Exception as e:
+        _log_err(f"get_project search user projects exception: {e}")
     # tạo mới
     try:
         r = cffi.post("https://labs.google/fx/api/trpc/project.createProject",
                       headers={**H, "Content-Type": "application/json"},
                       data=json.dumps({"json": {"projectTitle": "ThinAptm", "toolName": "PINHOLE"}}), **_kw())
-        d = (((r.json() or {}).get("result") or {}).get("data") or {}).get("json") or {}
-        return d.get("projectId") or (d.get("result") or {}).get("projectId")
-    except Exception:
-        return None
+        if r.status_code == 200:
+            d = (((r.json() or {}).get("result") or {}).get("data") or {}).get("json") or {}
+            proj_id = d.get("projectId") or (d.get("result") or {}).get("projectId")
+            if proj_id:
+                return proj_id
+        _log_err(f"createProject failed with status: {r.status_code}, response: {r.text[:200]}")
+    except Exception as e:
+        _log_err(f"get_project create project exception: {e}")
+    return None
 
 
 def _hf(bearer):  # headers Firefox cho android_bypass
@@ -88,16 +110,26 @@ def _hc(bearer):  # headers Chrome cho poll/upload
 
 # ---------- UPLOAD ảnh (cho I2V / ảnh tham chiếu) ----------
 def upload_image(bearer, project, image_path, timeout=120):
-    with open(image_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
+    try:
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+    except Exception as e:
+        _log_err(f"upload_image failed to read file {image_path}: {e}")
+        return None
     payload = {"clientContext": {"sessionId": f";{int(time.time()*1000)}", "projectId": project, "tool": "PINHOLE"}, "imageBytes": b64}
     try:
         r = cffi.post(f"{BASE}/flow/uploadImage?key={KEY}", headers=_hc(bearer), data=json.dumps(payload), **_kw(timeout))
         if r.status_code in (200, 201):
             media = (r.json() or {}).get("media") or {}
-            return media.get("name") if isinstance(media, dict) else (media[0].get("name") if media else None)
-    except Exception:
-        pass
+            media_id = media.get("name") if isinstance(media, dict) else (media[0].get("name") if media else None)
+            if media_id:
+                return media_id
+            else:
+                _log_err(f"upload_image success but media ID not found. JSON: {r.json()}")
+        else:
+            _log_err(f"upload_image failed status: {r.status_code}, response: {r.text[:300]}")
+    except Exception as e:
+        _log_err(f"upload_image request exception: {e}")
     return None
 
 
@@ -134,13 +166,37 @@ def _vpayload(prompt, project, seed, aspect, model, ref_media_id=None):
 
 
 def _classify(r):
+    """Phân loại lỗi generate (port từ veo3top flow_client.classify) — MỖI loại xử lý KHÁC nhau:
+      auth            = 401 bearer chết         -> refresh bearer từ cookie
+      ip_block        = HTML "Sorry" (chặn IP)  -> backoff (không proxy để xoay)
+      recaptcha_quota = 429 RESOURCE_EXHAUSTED  -> ACCOUNT CẠN QUOTA: nghỉ dài + đổi account (grind vô ích)
+      ratelimit       = TOO_MUCH_TRAFFIC trần   -> rate-limit theo IP: backoff nhẹ
+      unusual/retry   = token/bypass trượt lượt -> thử lại NHANH (fresh request điểm cao hơn)
+    """
     if r.status_code == 401:
         return "auth", None
-    b = r.text
-    if "UNUSUAL" in b:
+    txt = r.text
+    head = txt[:200].lower()
+    if "<html" in head or "sorry" in head:
+        return "ip_block", None
+    # 429: phân biệt cạn-quota-reCAPTCHA (RESOURCE_EXHAUSTED) vs rate-limit-IP (TOO_MUCH_TRAFFIC trần).
+    # Body cạn-quota CŨNG chứa TOO_MUCH_TRAFFIC -> phải check RESOURCE_EXHAUSTED/reCAPTCHA TRƯỚC.
+    if r.status_code == 429 or "TOO_MUCH_TRAFFIC" in txt or "RESOURCE_EXHAUSTED" in txt:
+        if "RESOURCE_EXHAUSTED" in txt or "reCAPTCHA" in txt or "UNUSUAL_ACTIVITY" in txt:
+            return "recaptcha_quota", None
+        return "ratelimit", None
+    try:
+        reason = r.json()["error"]["details"][0]["reason"]
+        if reason == "PUBLIC_ERROR_UNUSUAL_ACTIVITY":
+            return "unusual", None
+        if "TOO_MUCH_TRAFFIC" in reason:
+            return "ratelimit", None
+        if "RESOURCE_EXHAUSTED" in reason:
+            return "recaptcha_quota", None
+    except Exception:
+        pass
+    if "UNUSUAL" in txt:
         return "unusual", None
-    if r.status_code == 429 or "RESOURCE_EXHAUSTED" in b or "TOO_MUCH_TRAFFIC" in b:
-        return "quota", None
     return "retry", None
 
 
@@ -152,7 +208,8 @@ def submit_video(bearer, project, prompt, seed, aspect, model, ref_media_id=None
     payload = _vpayload(prompt, project, seed, aspect, model, ref_media_id)
     try:
         r = cffi.post(url, headers=_hf(bearer), data=json.dumps(payload), **_kw(timeout))
-    except Exception:
+    except Exception as e:
+        _log_err(f"submit_video HTTP client exception: {e}")
         return "retry", None
     if r.status_code == 200:
         j = r.json()
@@ -165,7 +222,15 @@ def submit_video(bearer, project, prompt, seed, aspect, model, ref_media_id=None
             for m in j.get("media", []):
                 if m.get("name"):
                     ops.append(m["name"])
-        return ("ok", ops) if ops else ("retry", None)
+        if ops:
+            return "ok", ops
+        else:
+            _log_err(f"submit_video succeeded but no operations found in JSON: {j}")
+            return "retry", None
+    if r.status_code != 429:
+        _log_err(f"submit_video API failed status: {r.status_code}, response: {r.text[:300]}")
+    else:
+        _log_err(f"submit_video API failed status: 429")
     return _classify(r)
 
 
@@ -185,21 +250,36 @@ def _find_status(o, out=None):
 
 def poll_video(bearer, ops, max_attempts=90, interval=8, timeout=60):
     body = {"operations": [{"operation": {"name": n}} for n in ops]}
-    for _ in range(max_attempts):
+    for attempt in range(max_attempts):
         try:
             r = cffi.post(CHECK, headers=_hc(bearer), data=json.dumps(body), **_kw(timeout))
-        except Exception:
+        except Exception as e:
+            _log_err(f"poll_video network exception (attempt {attempt+1}/{max_attempts}): {e}")
             time.sleep(interval); continue
         if r.status_code == 401:
+            _log_err(f"poll_video unauthorized (401)")
             return "auth", None
         if r.status_code != 200:
+            _log_err(f"poll_video check failed status {r.status_code}, response: {r.text[:300]}")
             time.sleep(interval); continue
         st = _find_status(r.json())
         if any(x in s for s in st for x in ("SUCCESSFUL", "SUCCEEDED", "COMPLETE")):
             return "done", ops[0]
         if any("FAIL" in s for s in st):
-            return "failed", None
+            err_msg = "UNKNOWN_ERROR"
+            try:
+                for o in r.json().get("operations", []):
+                    op_err = (o.get("operation") or {}).get("error") or {}
+                    msg = op_err.get("message")
+                    if msg:
+                        err_msg = msg
+                        break
+            except Exception:
+                pass
+            _log_err(f"poll_video generation failed. API response: {r.json()}")
+            return "failed", err_msg
         time.sleep(interval)
+    _log_err(f"poll_video timeout after {max_attempts} attempts.")
     return "timeout", None
 
 
@@ -213,8 +293,10 @@ def download_video(media_id, cookie, dst, timeout=180):
             with open(dst, "wb") as f:
                 f.write(r.content)
             return len(r.content)
-    except Exception:
-        pass
+        else:
+            _log_err(f"download_video failed. status: {r.status_code}, content-type: {r.headers.get('content-type')}, response: {r.text[:200]}")
+    except Exception as e:
+        _log_err(f"download_video exception: {e}")
     return 0
 
 
