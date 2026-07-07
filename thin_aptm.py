@@ -93,6 +93,7 @@ AUTH_REST = 1800           # nghỉ 30' khi 401 không cứu được bằng ref
 BEARER_TTL = 1200          # refresh bearer từ cookie sau 20' (bearer Google chết ~30')
 JOB_MAX_CYCLES = 40        # 1 job được chuyền/thử tối đa bao nhiêu lượt trước khi bỏ (chống kẹt vô hạn)
 POLL_MAX = 60              # số lần poll trạng thái render / job
+AUTO_RETRY_ROUNDS = 2      # sau khi chạy xong, TỰ retry các job lỗi thêm bao nhiêu vòng
 
 
 def _dur_label(secs):
@@ -170,6 +171,23 @@ class App(ctk.CTk):
         for j in self.jobs:
             if j.get("status") == "đang":
                 j["status"] = "chờ"
+        # TỰ DỌN hàng đợi cũ khi mở app: bỏ job ĐÃ CÓ VIDEO (out tồn tại) hoặc THIẾU ẢNH GỐC
+        # (ổ rời rút / file bị xóa/di chuyển) -> không còn dữ liệu cũ rác trỏ sai chỗ.
+        self._startup_clean_msg = ""
+        if self.jobs:
+            keep = []; n_done = n_miss = 0
+            for j in self.jobs:
+                o = j.get("out")
+                if o and os.path.exists(o):
+                    n_done += 1; continue
+                r = j.get("ref")
+                if j.get("type") == "i2v" and r and not os.path.exists(r):
+                    n_miss += 1; continue
+                keep.append(j)
+            if n_done or n_miss:
+                self.jobs = keep
+                save_settings({**self.settings, "jobs": self.jobs})   # lưu ngay để lần sau sạch
+                self._startup_clean_msg = f"🧹 Tự dọn hàng đợi: bỏ {n_done} job đã có video, {n_miss} job thiếu ảnh gốc."
         self.image_paths = self.settings.get("image_paths", [])
         self.loaded_prompts = self.settings.get("custom_prompts", [])
         self._stop = False; self._running = False
@@ -216,6 +234,8 @@ class App(ctk.CTk):
         self._build_acc(); self._build_gen(); self._build_queue()
         self._show("acc")
         self.after(2000, self._update_pool)   # panel trạng thái pool video (live)
+        if self._startup_clean_msg:
+            self._log(self._startup_clean_msg)
 
     def _show(self, key):
         for f in self.frames.values(): f.pack_forget()
@@ -947,6 +967,8 @@ class App(ctk.CTk):
                 # 1) Upload ảnh reference (I2V) -> media_id, cache theo account (khỏi upload lại khi retry)
                 ref_mid = None
                 if job["type"] == "i2v" and job.get("ref"):
+                    if not os.path.exists(job["ref"]):
+                        return ("fail", "noimg")   # ảnh gốc không đọc được (ổ rời rút / file bị xóa) -> bỏ gọn, KHÔNG retry
                     with st.lock:
                         ref_mid = st.refcache.get(job["ref"])
                     if not ref_mid:
@@ -1048,7 +1070,12 @@ class App(ctk.CTk):
                     else:
                         st.fails += 1
                         reason = outcome[1] if isinstance(outcome, tuple) and len(outcome) > 1 else "lỗi"
-                        job["status"] = "vi phạm cs" if reason == "policy" else "lỗi"
+                        if reason == "policy":
+                            job["status"] = "vi phạm cs"        # vi phạm chính sách -> không retry
+                        elif reason == "noimg":
+                            job["status"] = "lỗi"; job["_noretry"] = True   # thiếu ảnh gốc -> không retry vô ích
+                        else:
+                            job["status"] = "lỗi"
                     self.after(0, self._refresh_queue)
 
             threads = []
@@ -1057,17 +1084,37 @@ class App(ctk.CTk):
                     t = threading.Thread(target=worker, args=(st,), daemon=True)
                     t.start(); threads.append(t)
 
+            def _drain():
+                while not self._stop:
+                    if all(j["status"] in ("xong", "lỗi", "vi phạm cs") for j in todo):
+                        return
+                    time.sleep(1.5)
+
             # Chờ tới khi mọi job kết thúc (xong/lỗi/vi phạm) hoặc user bấm Dừng
-            while not self._stop:
-                if all(j["status"] in ("xong", "lỗi", "vi phạm cs") for j in todo):
+            _drain()
+
+            # TỰ RETRY job lỗi sau khi chạy xong (bỏ qua vi phạm cs + thiếu ảnh — retry vô ích).
+            for rnd in range(AUTO_RETRY_ROUNDS):
+                if self._stop:
                     break
-                time.sleep(1.5)
+                retry = [j for j in todo if j["status"] == "lỗi" and not j.get("_noretry")]
+                if not retry:
+                    break
+                self._log(f"↻ Tự retry {len(retry)} job lỗi (vòng {rnd+1}/{AUTO_RETRY_ROUNDS})...")
+                for j in retry:
+                    j["status"] = "chờ"; j["_cycles"] = 0; jobq.put(j)   # worker vẫn sống -> nhặt lại
+                self.after(0, lambda: self._refresh_queue(force=True))
+                _drain()
+
             done_flag[0] = True
             for t in threads:
                 t.join(timeout=5)
 
             done = sum(1 for j in todo if j["status"] == "xong")
-            self._log(f"🎉 XONG hàng đợi. Thành công {done}/{len(todo)}"
+            err = sum(1 for j in todo if j["status"] == "lỗi")
+            noimg = sum(1 for j in todo if j["status"] == "lỗi" and j.get("_noretry"))
+            self._log(f"🎉 XONG hàng đợi. Thành công {done}/{len(todo)} · lỗi {err}"
+                      + (f" (trong đó {noimg} thiếu ảnh gốc)" if noimg else "")
                       + (" (đã dừng)" if self._stop else "") + ".")
             for st in states:
                 self._log(f"   [{st.email[:20]}] xong {st.wins} · lỗi {st.fails}")
