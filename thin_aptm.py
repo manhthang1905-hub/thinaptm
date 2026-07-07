@@ -244,6 +244,7 @@ class App(ctk.CTk):
         self._stop = False; self._running = False
         self.check_vars = []  # BooleanVar cho mỗi job trong hàng đợi
         self._pool_states = []  # AccountState[] của phiên chạy hiện tại (cho panel trạng thái pool)
+        self._run_t0 = 0.0; self._eta_jobs = []; self._run_done0 = 0   # để tính tốc độ + ETA
         # Gemini: viết lại prompt vi phạm (nhiều key, xoay tìm key dùng được)
         self.gemini_keys = self.settings.get("gemini_keys", [])
         self._gemini_bad = set()       # key sai/hết quyền -> loại
@@ -664,6 +665,9 @@ class App(ctk.CTk):
             ctk.CTkLabel(c, text=txt, font=("", 11), text_color=T2).pack(pady=(6, 0))
             lb = ctk.CTkLabel(c, text="0", font=("", 20, "bold"), text_color=col); lb.pack(pady=(0, 6))
             self.pool_stat_lbl[key] = lb
+        # Dòng tốc độ + ước tính thời gian hoàn thành
+        self.pool_eta_lbl = ctk.CTkLabel(poolcard, text="", font=("", 12, "bold"), text_color=AC, anchor="w")
+        self.pool_eta_lbl.pack(fill="x", padx=16, pady=(2, 2))
         self.pool_rows_frame = ctk.CTkFrame(poolcard, fg_color="transparent"); self.pool_rows_frame.pack(fill="x", padx=14, pady=(2, 12))
         self._pool_rows = {}          # email -> {nhãn giá trị}
         self._pool_row_sig = None     # chữ ký tập tài khoản (để biết khi nào dựng lại hàng)
@@ -814,9 +818,31 @@ class App(ctk.CTk):
             if tag:
                 self.txt_queue.tag_add(tag, f"{line_idx+1}.0", f"{line_idx+1}.end")
 
+    def _eta_text(self):
+        """Tốc độ (video/phút) + ước tính khi nào xong (sau bao lâu + lúc mấy giờ ngày nào)."""
+        jobs = getattr(self, "_eta_jobs", None) or []
+        t0 = getattr(self, "_run_t0", 0.0)
+        if not self._running or not jobs or not t0:
+            return ""
+        now = time.time()
+        xong = sum(1 for j in jobs if j["status"] == "xong")
+        made = xong - getattr(self, "_run_done0", 0)
+        # còn lại = chưa xong và chưa hỏng vĩnh viễn (vi phạm chính sách / thiếu ảnh gốc)
+        remaining = sum(1 for j in jobs if j["status"] not in ("xong", "vi phạm cs") and not j.get("_noretry"))
+        elapsed = now - t0
+        rate_min = made / (elapsed / 60.0) if (elapsed > 5 and made > 0) else 0.0
+        if rate_min <= 0:
+            return f"⚡ Đang đo tốc độ…   ·   còn {remaining} video"
+        eta_min = remaining / rate_min
+        fin = time.localtime(now + eta_min * 60)
+        dur = f"{int(eta_min // 60)}g{int(eta_min % 60):02d}p" if eta_min >= 60 else f"{int(eta_min)+1}p"
+        return (f"⚡ {rate_min:.1f} video/phút   ·   còn {remaining} video   ·   "
+                f"dự kiến xong sau {dur}  (≈ {time.strftime('%H:%M', fin)}  {time.strftime('%d/%m', fin)})")
+
     def _update_pool(self):
         """Panel POOL VIDEO (cập nhật mỗi 2s): 4 ô tổng quan + bảng tài khoản. Tốc độ TỰ ĐỘNG (AIMD)."""
         try:
+            self.pool_eta_lbl.configure(text=self._eta_text())
             states = getattr(self, "_pool_states", None) or []
             total = len(states)
             resting = sum(1 for s in states if s.rest_remaining() > 0)
@@ -1068,6 +1094,11 @@ class App(ctk.CTk):
 
             total = len(states) * wpa
             self._log(f"🚀 {len(states)} tài khoản × {wpa} luồng = {total} luồng. Bắt đầu {len(todo)} job.")
+
+            # mốc để tính tốc độ (video/phút) + ước tính thời gian hoàn thành
+            self._run_t0 = time.time()
+            self._eta_jobs = todo
+            self._run_done0 = sum(1 for j in todo if j["status"] == "xong")
 
             jobq = queue.Queue()
             for j in todo:
